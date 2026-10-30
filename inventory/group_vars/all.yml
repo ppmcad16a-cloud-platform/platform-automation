@@ -81,3 +81,27 @@ shop_services:
   - notification-service
   - api-gateway-service
   - client-service
+
+# ---------- stopped-standby failover (GCP primary; Azure, AWS sleep)
+# Like a stopped EC2 instance: fully configured, machines off, cheap -
+# and much faster to start (3-10 min) than to build (20-40 min).
+primary_cloud: gcp
+standby:
+  azure:
+    # Running | Stopped
+    state_cmd: az aks show --resource-group rg-prod-cluster --name prod-aks --query powerState.code --output tsv
+    asleep_when: Stopped
+    sleep:
+      - az aks stop --resource-group rg-prod-cluster --name prod-aks
+    wake:
+      - az aks start --resource-group rg-prod-cluster --name prod-aks
+  aws:
+    # desired number of nodes: 2 awake, 0 asleep (the EKS control plane keeps running)
+    state_cmd: aws eks describe-nodegroup --cluster-name prod-eks --nodegroup-name default --region ap-south-1 --query nodegroup.scalingConfig.desiredSize --output text
+    asleep_when: "0"
+    sleep:
+      - aws eks update-nodegroup-config --cluster-name prod-eks --nodegroup-name default --region ap-south-1 --scaling-config minSize=0,maxSize=3,desiredSize=0
+      - aws eks wait nodegroup-active --cluster-name prod-eks --nodegroup-name default --region ap-south-1
+    wake:
+      - aws eks update-nodegroup-config --cluster-name prod-eks --nodegroup-name default --region ap-south-1 --scaling-config minSize=2,maxSize=3,desiredSize=2
+      - aws eks wait nodegroup-active --cluster-name prod-eks --nodegroup-name default --region ap-south-1

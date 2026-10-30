@@ -1,0 +1,12 @@
+# Put the standby clouds to sleep (default: azure and aws), or only one:
+#   ansible-playbook playbooks/standby.yml                 # azure + aws
+#   ansible-playbook playbooks/standby.yml -e cloud=azure  # only azure
+# GCP (primary) keeps serving every shopper; a sleeping standby costs only
+# its load balancer, IP and disks (+ the EKS control plane on AWS).
+- name: Standby clouds go to sleep
+  hosts: "{{ cloud | default('azure:aws') }}"
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Sleep
+      ansible.builtin.include_tasks: tasks/sleep-cloud.yml

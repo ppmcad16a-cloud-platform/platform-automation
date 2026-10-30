@@ -1,0 +1,41 @@
+# End of a session - one command, and it REFUSES to continue whenever a
+# step did not fully work. (Done by hand, skipping one step once left an AWS
+# load balancer and four disks behind - 2026-10-30.)
+#
+# Per cloud:
+#   1. add-ons destroy  -> the add-ons' Terraform state must then be EMPTY
+#   2. leftover check   -> no load balancer / disk the add-ons created is left
+#   3. cluster destroy  -> the cluster's Terraform state must then be EMPTY
+# AKS and EKS are torn down at the same time; GKE afterwards (Jenkins and the
+# central Grafana live there). Last, global-platform: it may only DELETE
+# (DNS records, pools, load balancer, Atlas IPs) - anything else stops it.
+#
+# Run (WSL Ubuntu, in this repo):  ansible-playbook playbooks/down.yml
+- name: Preflight
+  ansible.builtin.import_playbook: preflight.yml
+
+- name: Tear down AKS and EKS (both at the same time)
+  hosts: azure:aws
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Add-ons -> leftover check -> cluster
+      ansible.builtin.include_tasks: tasks/teardown-cloud.yml
+
+- name: Tear down GKE (last - Jenkins and the central Grafana live here)
+  hosts: gcp
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Add-ons -> leftover check -> cluster
+      ansible.builtin.include_tasks: tasks/teardown-cloud.yml
+
+- name: Global layer - remove what pointed at the clusters
+  hosts: localhost
+  gather_facts: false
+  environment: "{{ tf_env | combine(global_secrets_env) }}"
+  tasks:
+    - name: Plan, check that it only deletes, apply
+      ansible.builtin.include_tasks: tasks/global-apply.yml
+      vars:
+        allowed_actions: [delete]

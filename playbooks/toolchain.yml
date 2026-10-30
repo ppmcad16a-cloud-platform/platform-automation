@@ -152,4 +152,5 @@
       become: false
     - name: Show them
       ansible.builtin.debug:
-        msg: "{{ versions.results | map(attribute='stdout_lines') | map('first') | list }}"
+        # whole output on one line each (kubelogin prints its version on line 2)
+        msg: "{{ versions.results | map(attribute='stdout') | map('regex_replace', '\\s+', ' ') | map('truncate', 100) | list }}"

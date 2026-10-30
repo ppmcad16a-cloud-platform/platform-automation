@@ -21,3 +21,30 @@ awscli_sha256: b11ed416d91f4251da363a17706938eeaf0e520745754c104c0c1890dd8363c7
 # linked into /usr/local/bin: re-running changes nothing, and a version bump
 # is just a new folder + a new link.
 tools_dir: /opt/tools
+
+# ---------- used by preflight / up / down
+azure_subscription_id: 9c0602c2-72a4-4432-a192-7abf998e2b60
+aws_account_id: "722867460821"
+
+# Environment for every Terraform / CLI step.
+tf_env:
+  AWS_PROFILE: HeroviredProfile
+  TF_IN_AUTOMATION: "1"   # shorter output, no "run terraform apply next" hints
+  TF_INPUT: "0"           # never stop to ask a question
+  TF_PLUGIN_CACHE_DIR: "{{ lookup('env', 'HOME') }}/.terraform.d/plugin-cache"
+
+# What may NOT be left behind after an add-ons destroy, per cloud. Each
+# command must print nothing; down.yml waits up to 5 minutes, then stops
+# BEFORE destroying the cluster (so Kubernetes can still clean up).
+leftover_checks:
+  aws:
+    - what: load balancers made by the AWS LB controller
+      cmd: aws elbv2 describe-load-balancers --region ap-south-1 --query "LoadBalancers[?starts_with(LoadBalancerName, 'k8s-')].LoadBalancerName" --output text
+    - what: disks made by the EBS driver (Prometheus, Loki)
+      cmd: aws ec2 describe-volumes --region ap-south-1 --filters Name=status,Values=available Name=tag-key,Values=kubernetes.io/created-for/pvc/name --query "Volumes[].VolumeId" --output text
+  gcp:
+    - what: disks made for Prometheus / Loki
+      cmd: gcloud compute disks list --project project-899ced78-a554-40c2-96c --filter="name~^pvc-" --format="value(name)"
+    - what: load balancers made for the gateway
+      cmd: gcloud compute forwarding-rules list --project project-899ced78-a554-40c2-96c --format="value(name)"
+  azure: [] # AKS deletes its disks and load balancer together with the cluster

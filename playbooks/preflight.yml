@@ -1,0 +1,102 @@
+# Preflight: is everything ready BEFORE anything is created or destroyed?
+#   - the pinned tools are installed
+#   - you are logged in to Google Cloud, Azure and AWS (inside WSL)
+#   - your public IP is the admin_cidr in every cluster stack (else the
+#     cluster APIs would refuse Terraform/kubectl)
+#   - the global-platform secrets (Cloudflare token, Atlas keys) are known:
+#     taken from the environment, or asked for once (input stays hidden)
+# Used by up.yml and down.yml; can also be run on its own.
+- name: Preflight - is everything ready?
+  hosts: localhost
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Terraform is the pinned version
+      ansible.builtin.command: terraform version
+      register: tf
+      changed_when: false
+      failed_when: tool_versions.terraform not in tf.stdout
+    - name: A folder for Terraform's provider cache (faster init in every stack)
+      ansible.builtin.file:
+        path: "{{ tf_env.TF_PLUGIN_CACHE_DIR }}"
+        state: directory
+        mode: "0755"
+
+    # ---------- logins (run them yourself first - see README)
+    - name: Logged in to Google Cloud?
+      ansible.builtin.command: gcloud auth application-default print-access-token
+      register: gcp_login
+      changed_when: false
+      failed_when: false
+      no_log: true
+    - name: Logged in to Azure?
+      ansible.builtin.command: az account show --query id -o tsv
+      register: az_login
+      changed_when: false
+      failed_when: false
+    - name: Logged in to AWS?
+      ansible.builtin.command: aws sts get-caller-identity --query Account --output text
+      register: aws_login
+      changed_when: false
+      failed_when: false
+    - name: All three logins are valid
+      ansible.builtin.assert:
+        that:
+          - gcp_login.rc == 0
+          - az_login.rc == 0 and az_login.stdout == azure_subscription_id
+          - aws_login.rc == 0 and aws_login.stdout == aws_account_id
+        fail_msg: >-
+          Not logged in everywhere (gcp={{ gcp_login.rc == 0 }}, azure={{ az_login.rc == 0 }},
+          aws={{ aws_login.rc == 0 }}). In WSL run:
+          gcloud auth application-default login --no-launch-browser ;
+          az login --use-device-code ;
+          aws sso login --profile HeroviredProfile --use-device-code
+        success_msg: "Logged in to GCP, Azure (subscription {{ az_login.stdout }}) and AWS ({{ aws_login.stdout }})"
+
+    # ---------- your IP must be the clusters' admin_cidr
+    - name: Your public IP
+      ansible.builtin.uri:
+        url: https://api.ipify.org
+        return_content: true
+      register: myip
+    - name: Read admin_cidr from every cluster/add-ons stack
+      ansible.builtin.slurp:
+        src: "{{ repos_root }}/{{ item.0 }}-platform/environments/prod/{{ item.1 }}/terraform.tfvars"
+      loop: "{{ ['gcp', 'azure', 'aws'] | product(['cluster', 'addons']) | list }}"
+      register: tfvars
+    - name: admin_cidr everywhere = your IP
+      ansible.builtin.assert:
+        that: (item.content | b64decode) is search('admin_cidr\s*=\s*"' ~ (myip.content | trim) ~ '/32"')
+        fail_msg: >-
+          {{ item.source }} does not allow your current IP {{ myip.content | trim }}.
+          Set admin_cidr = "{{ myip.content | trim }}/32" in all six terraform.tfvars, then re-run.
+        quiet: true
+      loop: "{{ tfvars.results }}"
+      loop_control:
+        label: "{{ item.item | join('/') }}"
+
+    # ---------- secrets for global-platform (never written to disk)
+    - name: Ask for the Cloudflare token (input hidden) - unless CLOUDFLARE_API_TOKEN is set
+      ansible.builtin.pause:
+        prompt: "Cloudflare API token"
+        echo: false
+      register: cf_prompt
+      when: lookup('env', 'CLOUDFLARE_API_TOKEN') == ''
+    - name: Ask for the Atlas public key - unless MONGODB_ATLAS_PUBLIC_KEY is set
+      ansible.builtin.pause:
+        prompt: "MongoDB Atlas public key"
+      register: atlas_pub_prompt
+      when: lookup('env', 'MONGODB_ATLAS_PUBLIC_KEY') == ''
+    - name: Ask for the Atlas private key (input hidden) - unless MONGODB_ATLAS_PRIVATE_KEY is set
+      ansible.builtin.pause:
+        prompt: "MongoDB Atlas private key"
+        echo: false
+      register: atlas_priv_prompt
+      when: lookup('env', 'MONGODB_ATLAS_PRIVATE_KEY') == ''
+    - name: Keep them in memory for the global-platform steps
+      ansible.builtin.set_fact:
+        global_secrets_env:
+          CLOUDFLARE_API_TOKEN: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') or cf_prompt.user_input }}"
+          MONGODB_ATLAS_PUBLIC_KEY: "{{ lookup('env', 'MONGODB_ATLAS_PUBLIC_KEY') or atlas_pub_prompt.user_input }}"
+          MONGODB_ATLAS_PRIVATE_KEY: "{{ lookup('env', 'MONGODB_ATLAS_PRIVATE_KEY') or atlas_priv_prompt.user_input }}"
+      no_log: true

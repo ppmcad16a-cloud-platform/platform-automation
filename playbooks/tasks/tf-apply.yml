@@ -1,0 +1,64 @@
+# Guarded Terraform apply for ONE stack:
+#   plan -> read WHAT the plan would do -> stop unless every change is one of
+#   allowed_actions -> apply exactly that plan.
+# Vars:
+#   tf_dir           the stack folder
+#   tf_label         a short name for the output, e.g. "gcp/cluster"
+#   allowed_actions  e.g. [create, update] (session start) or [delete] (end)
+# A "replace" shows up as delete + create, so [create, update] never allows it.
+- name: "{{ tf_label }} | terraform init"
+  ansible.builtin.command:
+    cmd: terraform init -input=false -no-color
+    chdir: "{{ tf_dir }}"
+  changed_when: false
+
+- name: "{{ tf_label }} | terraform plan"
+  ansible.builtin.command:
+    cmd: terraform plan -input=false -no-color -out=ansible.tfplan
+    chdir: "{{ tf_dir }}"
+  changed_when: false
+
+- name: "{{ tf_label }} | read the plan"
+  ansible.builtin.command:
+    cmd: terraform show -json ansible.tfplan
+    chdir: "{{ tf_dir }}"
+  register: plan_json
+  changed_when: false
+  no_log: true # the JSON can contain secret values
+
+- name: "{{ tf_label }} | what would change"
+  ansible.builtin.set_fact:
+    planned: >-
+      {{ (plan_json.stdout | from_json).resource_changes | default([])
+         | rejectattr('change.actions', 'equalto', ['no-op'])
+         | rejectattr('change.actions', 'equalto', ['read'])
+         | map(attribute='address')
+         | zip((plan_json.stdout | from_json).resource_changes | default([])
+               | rejectattr('change.actions', 'equalto', ['no-op'])
+               | rejectattr('change.actions', 'equalto', ['read'])
+               | map(attribute='change.actions'))
+         | list }}
+
+- name: "{{ tf_label }} | show it"
+  ansible.builtin.debug:
+    msg: "{{ planned | map('join', ' -> ') | list if planned else 'nothing to change' }}"
+
+- name: "{{ tf_label }} | the plan may only: {{ allowed_actions | join(', ') }}"
+  ansible.builtin.assert:
+    that: planned | map('last') | flatten | difference(allowed_actions) | length == 0
+    fail_msg: >-
+      {{ tf_label }}: the plan wants to do more than {{ allowed_actions | join('/') }} (see above).
+      Stopping - review it by hand: cd {{ tf_dir }}; terraform plan
+    quiet: true
+
+- name: "{{ tf_label }} | terraform apply (exactly the plan above)"
+  ansible.builtin.command:
+    cmd: terraform apply -input=false -no-color ansible.tfplan
+    chdir: "{{ tf_dir }}"
+  when: planned | length > 0
+  changed_when: true
+
+- name: "{{ tf_label }} | remove the plan file"
+  ansible.builtin.file:
+    path: "{{ tf_dir }}/ansible.tfplan"
+    state: absent

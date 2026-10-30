@@ -1,0 +1,100 @@
+# Start of a session - one command instead of ~30, in the right order:
+#   preflight -> image mirrors -> GKE (cluster, add-ons) -> AKS + EKS at the
+#   same time -> global layer -> the shop in all 3 clusters -> health checks.
+# Every Terraform step is guarded (tasks/tf-apply.yml): it may only create or
+# update - a plan that would delete or replace anything stops the run.
+#
+# Run (WSL Ubuntu, in this repo):  ansible-playbook playbooks/up.yml
+# Takes about 45-60 minutes. Safe to re-run after a failure: finished steps
+# show "nothing to change".
+- name: Preflight
+  ansible.builtin.import_playbook: preflight.yml
+
+- name: Image mirrors - AKS pulls these from our ACR (ghcr.io stalls in Azure)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Is the image already in ACR?
+      ansible.builtin.command: >-
+        az acr repository show-tags --name {{ acr_name }} --repository {{ item.repo }} --output tsv
+      loop: "{{ acr_mirrors }}"
+      loop_control:
+        label: "{{ item.repo }}:{{ item.tag }}"
+      register: mirror
+      changed_when: false
+      failed_when: false
+    - name: Copy the missing ones (Azure copies server-side)
+      ansible.builtin.command: >-
+        az acr import --name {{ acr_name }} --source {{ item.item.source }} --image {{ item.item.repo }}:{{ item.item.tag }}
+      loop: "{{ mirror.results }}"
+      loop_control:
+        label: "{{ item.item.repo }}:{{ item.item.tag }}"
+      when: item.item.tag not in item.stdout_lines
+      changed_when: true
+
+- name: GKE first (AKS and EKS read its egress IP for their API allow-lists)
+  hosts: gcp
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Cluster -> kubectl access -> add-ons
+      ansible.builtin.include_tasks: tasks/bringup-cloud.yml
+
+- name: AKS and EKS (both at the same time)
+  hosts: azure:aws
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Cluster -> kubectl access -> add-ons
+      ansible.builtin.include_tasks: tasks/bringup-cloud.yml
+
+- name: Global layer - DNS, load balancer pools, Atlas allow-list for the new clusters
+  hosts: localhost
+  gather_facts: false
+  environment: "{{ tf_env | combine(global_secrets_env) }}"
+  tasks:
+    - name: Guarded apply (create / update only)
+      ansible.builtin.include_tasks: tasks/tf-apply.yml
+      vars:
+        tf_dir: "{{ repos_root }}/global-platform"
+        tf_label: global
+        allowed_actions: [create, update]
+
+- name: The shop in all 3 clusters (at the same time)
+  hosts: clouds
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  vars:
+    image_tags: "{{ lookup('ansible.builtin.file', image_tags_file) | from_json }}"
+  tasks:
+    - name: "{{ inventory_hostname }} | helm upgrade --install (rolling, auto-rollback on failure)"
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install {{ item }} charts/microservice
+          --kube-context {{ kube_context }} --namespace mern
+          -f values/clouds/{{ inventory_hostname }}.yaml -f values/services/{{ item }}.yaml
+          --set image.tag={{ image_tags[item] }}
+          --rollback-on-failure --wait --timeout 8m
+        chdir: "{{ repos_root }}/platform-deployments"
+      loop: "{{ shop_services }}"
+      changed_when: true
+    - name: "{{ inventory_hostname }} | https://{{ inventory_hostname }}.{{ domain }}/api/health answers 200"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}.{{ domain }}/api/health"
+        return_content: true
+      register: health
+      until: health.status == 200
+      retries: 20
+      delay: 15
+
+- name: Ready
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Where everything is
+      ansible.builtin.debug:
+        msg:
+          - "Shop:    https://{{ domain }}  (gcp. / azure. / aws. for one cloud)"
+          - "Jenkins: https://jenkins.{{ domain }}   password: cd gcp-platform/environments/prod/addons; terraform output -raw jenkins_admin_password"
+          - "Grafana: https://grafana.{{ domain }}   password: cd gcp-platform/environments/prod/addons; terraform output -raw grafana_admin_password"
+          - "End of session: ansible-playbook playbooks/down.yml"

@@ -1,0 +1,136 @@
+# ============================================================
+# Failover: wake the sleeping standbys (stopped-standby model).
+#
+# Started AUTOMATICALLY by the Cloudflare Worker "mern-failover" when
+# Cloudflare sees the PRIMARY (GCP) pool go unhealthy - or by hand:
+#   gh workflow run failover-wake.yml -R ppmcad16a-cloud-platform/platform-automation
+#
+# Keyless and least-privilege: the Azure identity may only read + start
+# prod-aks; the AWS role may only read + resize the EKS standby node group.
+# "No cluster" (between sessions) and "already awake" both mean: nothing
+# to do, green run.
+# ============================================================
+name: Failover - wake standbys
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why the standbys are woken
+        required: false
+        default: manual
+
+permissions:
+  contents: read
+
+concurrency:
+  group: failover-wake
+  cancel-in-progress: false
+
+env:
+  DOMAIN: rishavmukhopadhyay.store
+
+jobs:
+  azure:
+    name: Wake Azure (AKS start)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Log in to Azure (keyless, start-only identity)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: d9e58707-f15c-4d6a-a088-f988e8c634ce
+          tenant-id: 0fd463ca-1b22-4674-bea5-699c2e0ad98b
+          allow-no-subscriptions: true
+
+      - name: Start AKS if it is asleep
+        id: wake
+        shell: bash
+        env:
+          SUB: 9c0602c2-72a4-4432-a192-7abf998e2b60
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "Reason: ${REASON}"
+          show() { az aks show --subscription "$SUB" -g rg-prod-cluster -n prod-aks --query "[powerState.code, provisioningState]" -o tsv; }
+          if ! out="$(show 2>/dev/null)"; then
+            echo "No AKS cluster - nothing to wake"
+            echo "### Azure: no cluster - nothing to wake" >> "$GITHUB_STEP_SUMMARY"
+            echo "woke=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          read -r power prov <<< "$out"
+          echo "AKS: power=${power} provisioning=${prov}"
+          if [ "$power" != "Stopped" ]; then
+            echo "### Azure: already awake (${power})" >> "$GITHUB_STEP_SUMMARY"
+            echo "woke=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          az aks start --subscription "$SUB" -g rg-prod-cluster -n prod-aks --no-wait
+          for i in $(seq 1 80); do
+            read -r power prov <<< "$(show)"
+            echo "$(date +%T) power=${power} provisioning=${prov}"
+            if [ "$power" = "Running" ] && [ "$prov" = "Succeeded" ]; then break; fi
+            sleep 15
+          done
+          [ "$power" = "Running" ] && [ "$prov" = "Succeeded" ]
+          echo "woke=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait until https://azure.<domain> serves the shop
+        if: steps.wake.outputs.woke == 'true'
+        shell: bash
+        run: |
+          for i in $(seq 1 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://azure.${DOMAIN}/api/health" || true)"
+            echo "$(date +%T) azure /api/health -> ${code}"
+            if [ "$code" = "200" ]; then echo "### Azure: woken and serving" >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+            sleep 15
+          done
+          echo "::error::Azure woke up but the shop did not answer within 15 minutes"; exit 1
+
+  aws:
+    name: Wake AWS (EKS nodes 0 -> 2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Log in to AWS (keyless, resize-only role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::722867460821:role/gha-failover-wake
+          aws-region: ap-south-1
+
+      - name: Scale the standby node group up if it is asleep
+        id: wake
+        shell: bash
+        run: |
+          set -euo pipefail
+          ng=(--cluster-name prod-eks --nodegroup-name default)
+          if ! desired="$(aws eks describe-nodegroup "${ng[@]}" --query nodegroup.scalingConfig.desiredSize --output text 2>/dev/null)"; then
+            echo "No EKS node group - nothing to wake"
+            echo "### AWS: no cluster - nothing to wake" >> "$GITHUB_STEP_SUMMARY"
+            echo "woke=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "EKS desired nodes: ${desired}"
+          if [ "$desired" != "0" ]; then
+            echo "### AWS: already awake (${desired} nodes)" >> "$GITHUB_STEP_SUMMARY"
+            echo "woke=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          aws eks update-nodegroup-config "${ng[@]}" --scaling-config minSize=2,maxSize=3,desiredSize=2
+          aws eks wait nodegroup-active "${ng[@]}"
+          echo "woke=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait until https://aws.<domain> serves the shop
+        if: steps.wake.outputs.woke == 'true'
+        shell: bash
+        run: |
+          for i in $(seq 1 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://aws.${DOMAIN}/api/health" || true)"
+            echo "$(date +%T) aws /api/health -> ${code}"
+            if [ "$code" = "200" ]; then echo "### AWS: woken and serving" >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+            sleep 15
+          done
+          echo "::error::AWS woke up but the shop did not answer within 15 minutes"; exit 1

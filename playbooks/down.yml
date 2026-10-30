@@ -8,7 +8,8 @@
 #   3. cluster destroy  -> the cluster's Terraform state must then be EMPTY
 # AKS and EKS are torn down at the same time; GKE afterwards (Jenkins and the
 # central Grafana live there). Last, global-platform: it may only DELETE
-# (DNS records, pools, load balancer, Atlas IPs) - anything else stops it.
+# (DNS records, pools, load balancer, Atlas IPs) or UPDATE (harmless provider
+# drift) - creating or replacing anything stops it.
 #
 # Run (WSL Ubuntu, in this repo):  ansible-playbook playbooks/down.yml
 - name: Preflight
@@ -48,4 +49,4 @@
       vars:
         tf_dir: "{{ repos_root }}/global-platform"
         tf_label: global
-        allowed_actions: [delete]
+        allowed_actions: [delete, update] # update: harmless provider drift; create/replace still stops it

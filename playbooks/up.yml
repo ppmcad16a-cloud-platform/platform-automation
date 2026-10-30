@@ -1,13 +1,18 @@
-# Start of a session - one command instead of ~30, in the right order:
-#   preflight -> image mirrors -> GKE (cluster, add-ons) -> AKS + EKS at the
-#   same time -> global layer -> the shop in all 3 clusters -> health checks
-#   -> Azure and AWS go to sleep (stopped standbys; GCP serves everyone).
+# Start of a session - one command, as parallel as the clouds allow:
+#   preflight -> image mirrors
+#   -> ALL THREE clusters at the same time (the GKE egress IP lives in GCP's
+#      foundation stack, so AKS and EKS no longer wait for GKE)
+#   -> global layer (DNS, pools, Atlas allow-list - it needs every cluster's IPs)
+#   -> then EACH cloud on its own, without waiting for the others:
+#        add-ons -> the shop (all 6 services at once) -> health check
+#        -> Azure / AWS go to sleep (stopped standbys; GCP serves everyone)
 # Every Terraform step is guarded (tasks/tf-apply.yml): it may only create or
 # update - a plan that would delete or replace anything stops the run.
 #
 # Run (WSL Ubuntu, in this repo):  ansible-playbook playbooks/up.yml
-# Takes about 45-60 minutes. Safe to re-run after a failure: finished steps
-# show "nothing to change".
+#   -e keep_awake=true   keep the standbys running at the end
+# Takes about 30-40 minutes (the slowest cloud decides). Safe to re-run after
+# a failure: finished steps show "nothing to change".
 - name: Preflight
   ansible.builtin.import_playbook: preflight.yml
 
@@ -33,23 +38,15 @@
       when: item.item.tag not in item.stdout_lines
       changed_when: true
 
-- name: GKE first (AKS and EKS read its egress IP for their API allow-lists)
-  hosts: gcp
+- name: All three clusters at the same time
+  hosts: clouds
   gather_facts: false
   environment: "{{ tf_env }}"
   tasks:
-    - name: Cluster -> kubectl access -> add-ons
-      ansible.builtin.include_tasks: tasks/bringup-cloud.yml
+    - name: Cluster -> kubectl access -> nodes Ready
+      ansible.builtin.include_tasks: tasks/cluster-up.yml
 
-- name: AKS and EKS (both at the same time)
-  hosts: azure:aws
-  gather_facts: false
-  environment: "{{ tf_env }}"
-  tasks:
-    - name: Cluster -> kubectl access -> add-ons
-      ansible.builtin.include_tasks: tasks/bringup-cloud.yml
-
-- name: Global layer - DNS, load balancer pools, Atlas allow-list for the new clusters
+- name: Global layer - DNS, load balancer pools, Atlas allow-list for the clusters
   hosts: localhost
   gather_facts: false
   environment: "{{ tf_env | combine(global_secrets_env) }}"
@@ -61,41 +58,40 @@
         tf_label: global
         allowed_actions: [create, update]
 
-- name: The shop in all 3 clusters (at the same time)
+- name: Each cloud on its own - add-ons, the shop, health, standbys sleep
   hosts: clouds
   gather_facts: false
+  strategy: free # a fast cloud never waits for a slower one
   environment: "{{ tf_env }}"
   vars:
     image_tags: "{{ lookup('ansible.builtin.file', image_tags_file) | from_json }}"
   tasks:
-    - name: "{{ inventory_hostname }} | helm upgrade --install (rolling, auto-rollback on failure)"
-      ansible.builtin.command:
-        cmd: >-
-          helm upgrade --install {{ item }} charts/microservice
-          --kube-context {{ kube_context }} --namespace mern
-          -f values/clouds/{{ inventory_hostname }}.yaml -f values/services/{{ item }}.yaml
-          --set image.tag={{ image_tags[item] }}
-          --rollback-on-failure --wait --timeout 8m
-        chdir: "{{ repos_root }}/platform-deployments"
-      loop: "{{ shop_services }}"
-      changed_when: true
-    - name: "{{ inventory_hostname }} | https://{{ inventory_hostname }}.{{ domain }}/api/health answers 200"
+    - name: Add-ons (guarded - create / update only)
+      ansible.builtin.include_tasks: tasks/tf-apply.yml
+      vars:
+        tf_dir: "{{ repos_root }}/{{ inventory_hostname }}-platform/environments/prod/addons"
+        tf_label: "{{ inventory_hostname }}/addons"
+        allowed_actions: [create, update]
+
+    - name: The shop - all 6 services at once
+      ansible.builtin.include_tasks: tasks/install-shop.yml
+      vars:
+        shop_install_services: "{{ shop_services }}"
+        shop_install_tags: "{{ image_tags }}"
+
+    - name: Health check - https://<cloud>.<domain>/api/health answers 200
       ansible.builtin.uri:
         url: "https://{{ inventory_hostname }}.{{ domain }}/api/health"
-        return_content: true
       register: health
       until: health.status == 200
       retries: 20
       delay: 15
 
-- name: Standby clouds go to sleep (skip with -e keep_awake=true)
-  hosts: azure:aws
-  gather_facts: false
-  environment: "{{ tf_env }}"
-  tasks:
-    - name: Sleep
+    - name: Standbys go to sleep (skip with -e keep_awake=true)
       ansible.builtin.include_tasks: tasks/sleep-cloud.yml
-      when: not (keep_awake | default(false) | bool)
+      when:
+        - inventory_hostname in standby
+        - not (keep_awake | default(false) | bool)
 
 - name: Ready
   hosts: localhost

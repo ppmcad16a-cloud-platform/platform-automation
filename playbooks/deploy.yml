@@ -1,0 +1,56 @@
+# BREAK-GLASS deploy: when Jenkins is not available (e.g. GCP - where it runs
+# - is down), deploy ONE service version from this laptop to every cloud
+# that is awake and reachable. Same rolling update + automatic rollback as
+# Jenkins; sleeping standbys and unreachable clouds are skipped (reported).
+#
+# Run:  ansible-playbook playbooks/deploy.yml -e service=catalog-service -e tag=main-a1b2c3d
+#       ... -e target=azure      only one cloud (default: all three)
+- name: Break-glass deploy (Jenkins unavailable)
+  hosts: "{{ target | default('clouds') }}"
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Valid service and tag
+      ansible.builtin.assert:
+        that:
+          - service is defined and service in shop_services
+          - tag is defined and tag is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+        fail_msg: "Use -e service=<one of {{ shop_services | join(', ') }}> -e tag=<image tag, e.g. main-a1b2c3d>"
+        quiet: true
+
+    - name: "{{ inventory_hostname }} | asleep?"
+      ansible.builtin.command: "{{ standby[inventory_hostname].state_cmd }}"
+      register: power
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname in standby
+
+    - name: "{{ inventory_hostname }} | skipped - sleeping standby (wake.yml catches it up when woken)"
+      ansible.builtin.meta: end_host
+      when:
+        - inventory_hostname in standby
+        - power.rc != 0 or power.stdout | trim == standby[inventory_hostname].asleep_when
+
+    - name: "{{ inventory_hostname }} | reachable?"
+      ansible.builtin.command: kubectl --context {{ kube_context }} get namespace mern --request-timeout=15s
+      register: reachable
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ inventory_hostname }} | skipped - cluster not reachable (down, or no kubectl access)"
+      ansible.builtin.meta: end_host
+      when: reachable.rc != 0
+
+    - name: "{{ inventory_hostname }} | deploy {{ service }} {{ tag }}"
+      ansible.builtin.include_tasks: tasks/install-shop.yml
+      vars:
+        shop_install_services: ["{{ service }}"]
+        shop_install_tags: "{{ {service: tag} }}"
+
+    - name: "{{ inventory_hostname }} | smoke test - https://{{ inventory_hostname }}.{{ domain }}/api/health"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}.{{ domain }}/api/health"
+      register: health
+      until: health.status == 200
+      retries: 12
+      delay: 10

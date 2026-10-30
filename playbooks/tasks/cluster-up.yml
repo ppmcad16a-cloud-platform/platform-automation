@@ -1,5 +1,7 @@
-# Bring up ONE cloud (the current inventory host): cluster -> kubectl access
-# -> add-ons. Both Terraform steps are guarded: create/update only.
+# Bring up ONE cloud's cluster (the current inventory host) - all three
+# clouds run this at the same time:
+#   cluster (guarded: create/update only) -> wake it if it is a sleeping
+#   standby -> kubectl access -> nodes Ready.
 - name: "{{ inventory_hostname }} | cluster (takes 10-20 minutes)"
   ansible.builtin.include_tasks: tf-apply.yml
   vars:
@@ -11,11 +13,11 @@
   ansible.builtin.include_tasks: wake-cloud.yml
   when: inventory_hostname in standby
 
-- name: "{{ inventory_hostname }} | kubectl access to the new cluster"
+- name: "{{ inventory_hostname }} | kubectl access to the cluster"
   ansible.builtin.command: "{{ item }}"
   loop: "{{ get_credentials[inventory_hostname] }}"
   changed_when: true
-  throttle: 1 # AKS and EKS both write ~/.kube/config - one at a time
+  throttle: 1 # all clouds write ~/.kube/config - one at a time
 
 - name: "{{ inventory_hostname }} | the nodes answer"
   ansible.builtin.command: kubectl --context {{ kube_context }} get nodes --no-headers
@@ -24,10 +26,3 @@
   retries: 20
   delay: 15
   changed_when: false
-
-- name: "{{ inventory_hostname }} | add-ons (takes 10-15 minutes)"
-  ansible.builtin.include_tasks: tf-apply.yml
-  vars:
-    tf_dir: "{{ repos_root }}/{{ inventory_hostname }}-platform/environments/prod/addons"
-    tf_label: "{{ inventory_hostname }}/addons"
-    allowed_actions: [create, update]

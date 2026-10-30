@@ -6,9 +6,9 @@ Ansible playbooks that run the multi-cloud MERN platform's routine work:
 |---|---|
 | `playbooks/toolchain.yml` | Installs the pinned CLIs (terraform, kubectl, helm, kubelogin, aws, az, gcloud) into WSL Ubuntu, checksum-verified (`-K` for sudo) |
 | `playbooks/preflight.yml` | Checks the tools, the 3 cloud logins, your IP vs. `admin_cidr`, and asks for the global secrets (hidden) |
-| `playbooks/up.yml` | Session start: mirrors -> GKE -> AKS + EKS -> global -> shop -> health checks (~45-60 min) |
-| `playbooks/down.yml` | Session end: per cloud add-ons -> leftover check -> cluster, then global (delete-only); stops on anything incomplete |
-| `playbooks/drill-failover.yml` | `-e drill_cloud=azure` - takes one cloud's gateway away for 5 min; shop must stay up, MernServiceDown must fire |
+| `playbooks/up.yml` | Session start: mirrors -> all 3 clusters at once -> global -> per cloud, independently: add-ons -> shop (6 services at once) -> health -> standbys sleep (~30-40 min; `-e keep_awake=true`) |
+| `playbooks/deploy.yml` | Break-glass deploy when Jenkins (GKE) is down: `-e service=catalog-service -e tag=main-a1b2c3d` to every awake, reachable cloud (`-e target=azure` for one) |
+| `playbooks/down.yml` | Session end: per cloud add-ons -> leftover check -> cluster, then global (delete/update only - never create or replace); stops on anything incomplete |
 | `playbooks/drill-restore.yml` | Runs Jenkins' restore-drill for GCS, S3 and Azure Blob and waits for all three verdicts |
 | `playbooks/standby.yml` / `playbooks/wake.yml` | Stopped standbys: Azure + AWS sleep (AKS stopped, EKS nodes 0) while GCP serves everyone; `wake.yml -e cloud=azure` starts one in ~5-10 min |
 | `playbooks/drill-failover.yml` | Stopped-standby drill: closes GCP's front door, a standby wakes (automatic, or `-e wake_via=manual`), measures the RTO, then repairs GCP and puts the standbys back to sleep |

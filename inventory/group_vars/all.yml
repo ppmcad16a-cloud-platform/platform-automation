@@ -1,0 +1,23 @@
+# Shared settings for all playbooks.
+
+# The platform repos (the same Windows folder, seen from WSL).
+repos_root: /mnt/c/Users/dell/Documents/HeroVired/Capstone/repos
+
+# Tool versions - the SAME as on the Windows side and in the Jenkins agents.
+# Each one was at least 14 days old when pinned; bump on purpose, in a PR.
+tool_versions:
+  terraform: 1.16.6
+  kubectl: 1.36.1
+  helm: 4.3.0
+  kubelogin: 0.2.21
+  awscli: 2.38.1
+  azure_cli: 2.91.0-1~noble
+  gcloud: 588.0.0-0
+
+# AWS publishes no checksum file for the CLI zip - fingerprint taken when pinned.
+awscli_sha256: b11ed416d91f4251da363a17706938eeaf0e520745754c104c0c1890dd8363c7
+
+# Every binary goes into its own versioned folder under /opt/tools and is
+# linked into /usr/local/bin: re-running changes nothing, and a version bump
+# is just a new folder + a new link.
+tools_dir: /opt/tools

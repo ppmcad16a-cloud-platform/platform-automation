@@ -1,0 +1,7 @@
+# Ansible collections used by the playbooks - pinned like everything else.
+# Install: ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: community.general   # terraform module
+    version: 13.5.0
+  - name: kubernetes.core     # helm / k8s modules
+    version: 6.6.0

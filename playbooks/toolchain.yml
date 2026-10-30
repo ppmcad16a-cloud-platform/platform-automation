@@ -1,0 +1,155 @@
+# Installs the pinned command-line tools this platform needs into WSL Ubuntu.
+# Every download is checked against its published SHA-256 before it is used.
+# Run:  ansible-playbook playbooks/toolchain.yml -K     (-K = asks for your sudo password)
+# Re-running is safe: nothing changes if everything is already in place.
+- name: Toolchain for the multi-cloud MERN platform
+  hosts: localhost
+  become: true
+  vars:
+    v: "{{ tool_versions }}"
+  tasks:
+    - name: Basic packages
+      ansible.builtin.apt:
+        name: [ca-certificates, curl, unzip, gnupg, jq]
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Folders for the versioned tools
+      ansible.builtin.file:
+        path: "{{ tools_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "terraform-{{ v.terraform }}"
+        - "kubectl-{{ v.kubectl }}"
+        - "helm-{{ v.helm }}"
+        - "kubelogin-{{ v.kubelogin }}"
+
+    # ---------- Terraform (zip, checked against HashiCorp's SHA256SUMS)
+    - name: Terraform - download
+      ansible.builtin.get_url:
+        url: "https://releases.hashicorp.com/terraform/{{ v.terraform }}/terraform_{{ v.terraform }}_linux_amd64.zip"
+        dest: "/tmp/terraform_{{ v.terraform }}_linux_amd64.zip"
+        checksum: "sha256:https://releases.hashicorp.com/terraform/{{ v.terraform }}/terraform_{{ v.terraform }}_SHA256SUMS"
+        mode: "0644"
+    - name: Terraform - unpack
+      ansible.builtin.unarchive:
+        src: "/tmp/terraform_{{ v.terraform }}_linux_amd64.zip"
+        dest: "{{ tools_dir }}/terraform-{{ v.terraform }}"
+        remote_src: true
+        creates: "{{ tools_dir }}/terraform-{{ v.terraform }}/terraform"
+
+    # ---------- kubectl (single binary + .sha256)
+    - name: kubectl - download
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/v{{ v.kubectl }}/bin/linux/amd64/kubectl"
+        dest: "{{ tools_dir }}/kubectl-{{ v.kubectl }}/kubectl"
+        checksum: "sha256:https://dl.k8s.io/release/v{{ v.kubectl }}/bin/linux/amd64/kubectl.sha256"
+        mode: "0755"
+
+    # ---------- Helm (tar.gz + .sha256sum)
+    - name: Helm - download
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-v{{ v.helm }}-linux-amd64.tar.gz"
+        dest: "/tmp/helm-v{{ v.helm }}-linux-amd64.tar.gz"
+        checksum: "sha256:https://get.helm.sh/helm-v{{ v.helm }}-linux-amd64.tar.gz.sha256sum"
+        mode: "0644"
+    - name: Helm - unpack
+      ansible.builtin.unarchive:
+        src: "/tmp/helm-v{{ v.helm }}-linux-amd64.tar.gz"
+        dest: "{{ tools_dir }}/helm-{{ v.helm }}"
+        remote_src: true
+        extra_opts: [--strip-components=1]
+        creates: "{{ tools_dir }}/helm-{{ v.helm }}/helm"
+
+    # ---------- kubelogin (AKS sign-in plugin; zip + .sha256)
+    - name: kubelogin - download
+      ansible.builtin.get_url:
+        url: "https://github.com/Azure/kubelogin/releases/download/v{{ v.kubelogin }}/kubelogin-linux-amd64.zip"
+        dest: "/tmp/kubelogin-linux-amd64.zip"
+        checksum: "sha256:https://github.com/Azure/kubelogin/releases/download/v{{ v.kubelogin }}/kubelogin-linux-amd64.zip.sha256"
+        mode: "0644"
+    - name: kubelogin - unpack
+      ansible.builtin.unarchive:
+        src: "/tmp/kubelogin-linux-amd64.zip"
+        dest: "{{ tools_dir }}/kubelogin-{{ v.kubelogin }}"
+        remote_src: true
+        creates: "{{ tools_dir }}/kubelogin-{{ v.kubelogin }}/bin/linux_amd64/kubelogin"
+
+    - name: Link the pinned binaries into /usr/local/bin
+      ansible.builtin.file:
+        src: "{{ item.src }}"
+        dest: "/usr/local/bin/{{ item.name }}"
+        state: link
+        force: true
+      loop:
+        - { name: terraform, src: "{{ tools_dir }}/terraform-{{ v.terraform }}/terraform" }
+        - { name: kubectl, src: "{{ tools_dir }}/kubectl-{{ v.kubectl }}/kubectl" }
+        - { name: helm, src: "{{ tools_dir }}/helm-{{ v.helm }}/helm" }
+        - { name: kubelogin, src: "{{ tools_dir }}/kubelogin-{{ v.kubelogin }}/bin/linux_amd64/kubelogin" }
+
+    # ---------- AWS CLI v2 (zip with its own installer; fingerprint pinned in group_vars)
+    - name: AWS CLI - download
+      ansible.builtin.get_url:
+        url: "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-{{ v.awscli }}.zip"
+        dest: "/tmp/awscli-exe-linux-x86_64-{{ v.awscli }}.zip"
+        checksum: "sha256:{{ awscli_sha256 }}"
+        mode: "0644"
+    - name: AWS CLI - unpack
+      ansible.builtin.unarchive:
+        src: "/tmp/awscli-exe-linux-x86_64-{{ v.awscli }}.zip"
+        dest: /tmp
+        remote_src: true
+        creates: "{{ tools_dir }}/aws-cli/v2/{{ v.awscli }}"
+    - name: AWS CLI - install
+      ansible.builtin.command:
+        cmd: /tmp/aws/install --install-dir {{ tools_dir }}/aws-cli --bin-dir /usr/local/bin --update
+        creates: "{{ tools_dir }}/aws-cli/v2/{{ v.awscli }}"
+
+    # ---------- Azure CLI + Google Cloud CLI (vendor apt repos, exact versions, held)
+    - name: Microsoft apt repository (azure-cli)
+      ansible.builtin.deb822_repository:
+        name: azure-cli
+        uris: https://packages.microsoft.com/repos/azure-cli/
+        suites: noble
+        components: main
+        architectures: amd64
+        signed_by: https://packages.microsoft.com/keys/microsoft.asc
+    - name: Google apt repository (gcloud)
+      ansible.builtin.deb822_repository:
+        name: google-cloud-sdk
+        uris: https://packages.cloud.google.com/apt
+        suites: cloud-sdk
+        components: main
+        signed_by: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    - name: Azure CLI + gcloud + GKE auth plugin at the pinned versions
+      ansible.builtin.apt:
+        name:
+          - "azure-cli={{ v.azure_cli }}"
+          - "google-cloud-cli={{ v.gcloud }}"
+          - "google-cloud-cli-gke-gcloud-auth-plugin={{ v.gcloud }}"
+        update_cache: true
+        allow_downgrade: true
+    - name: Hold them, so "apt upgrade" never changes their versions
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [azure-cli, google-cloud-cli, google-cloud-cli-gke-gcloud-auth-plugin]
+
+    # ---------- Proof: every tool answers with the pinned version
+    - name: Read the installed versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - terraform version
+        - kubectl version --client
+        - helm version --short
+        - kubelogin --version
+        - aws --version
+        - az version --output tsv --query '"azure-cli"'
+        - gcloud version
+      register: versions
+      changed_when: false
+      become: false
+    - name: Show them
+      ansible.builtin.debug:
+        msg: "{{ versions.results | map(attribute='stdout_lines') | map('first') | list }}"

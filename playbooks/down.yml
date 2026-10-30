@@ -14,6 +14,14 @@
 - name: Preflight
   ansible.builtin.import_playbook: preflight.yml
 
+- name: Wake sleeping standbys - only a RUNNING cluster can remove its load balancer and disks
+  hosts: azure:aws
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Wake (does nothing if already awake)
+      ansible.builtin.include_tasks: tasks/wake-cloud.yml
+
 - name: Tear down AKS and EKS (both at the same time)
   hosts: azure:aws
   gather_facts: false

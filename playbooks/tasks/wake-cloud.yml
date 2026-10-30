@@ -1,0 +1,38 @@
+# Wake ONE standby cloud (does nothing if it is already awake or is not a
+# standby): start the machines -> nodes Ready -> the shop answers on
+# https://<cloud>.<domain>/api/health. Cloudflare then sees the pool healthy
+# again and, if the primary is down, sends shoppers here.
+- name: "{{ inventory_hostname }} | asleep?"
+  ansible.builtin.command: "{{ standby[inventory_hostname].state_cmd }}"
+  register: power
+  changed_when: false
+  failed_when: false # no cluster at all (e.g. already torn down) -> nothing to wake
+  when: inventory_hostname in standby
+
+- name: "{{ inventory_hostname }} | wake up (AKS start / EKS nodes -> 2) - takes 3-10 minutes"
+  ansible.builtin.command: "{{ item }}"
+  loop: "{{ standby[inventory_hostname].wake }}"
+  when:
+    - inventory_hostname in standby
+    - power.rc == 0
+    - power.stdout | trim == standby[inventory_hostname].asleep_when
+  changed_when: true
+  register: woke
+
+- name: "{{ inventory_hostname }} | nodes Ready"
+  ansible.builtin.command: kubectl --context {{ kube_context }} get nodes --no-headers
+  register: nodes
+  until: nodes.rc == 0 and (nodes.stdout_lines | select('search', ' Ready ') | list | length) >= 2
+  retries: 40
+  delay: 15
+  changed_when: false
+  when: woke is changed
+
+- name: "{{ inventory_hostname }} | the shop answers again (pods restarted, secrets synced)"
+  ansible.builtin.uri:
+    url: "https://{{ inventory_hostname }}.{{ domain }}/api/health"
+  register: health
+  until: health.status == 200
+  retries: 40
+  delay: 15
+  when: woke is changed

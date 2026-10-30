@@ -7,6 +7,10 @@
     tf_label: "{{ inventory_hostname }}/cluster"
     allowed_actions: [create, update]
 
+- name: "{{ inventory_hostname }} | wake it first if it is a sleeping standby"
+  ansible.builtin.include_tasks: wake-cloud.yml
+  when: inventory_hostname in standby
+
 - name: "{{ inventory_hostname }} | kubectl access to the new cluster"
   ansible.builtin.command: "{{ item }}"
   loop: "{{ get_credentials[inventory_hostname] }}"

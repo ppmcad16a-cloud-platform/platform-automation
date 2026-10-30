@@ -1,0 +1,10 @@
+# Wake a sleeping standby cloud (the same steps the automatic failover runs):
+#   ansible-playbook playbooks/wake.yml -e cloud=azure
+#   ansible-playbook playbooks/wake.yml -e cloud=azure:aws   # both
+- name: Wake a standby cloud
+  hosts: "{{ cloud }}"
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Wake
+      ansible.builtin.include_tasks: tasks/wake-cloud.yml

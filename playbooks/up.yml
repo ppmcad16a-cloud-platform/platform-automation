@@ -1,6 +1,7 @@
 # Start of a session - one command instead of ~30, in the right order:
 #   preflight -> image mirrors -> GKE (cluster, add-ons) -> AKS + EKS at the
-#   same time -> global layer -> the shop in all 3 clusters -> health checks.
+#   same time -> global layer -> the shop in all 3 clusters -> health checks
+#   -> Azure and AWS go to sleep (stopped standbys; GCP serves everyone).
 # Every Terraform step is guarded (tasks/tf-apply.yml): it may only create or
 # update - a plan that would delete or replace anything stops the run.
 #
@@ -86,6 +87,15 @@
       until: health.status == 200
       retries: 20
       delay: 15
+
+- name: Standby clouds go to sleep (skip with -e keep_awake=true)
+  hosts: azure:aws
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Sleep
+      ansible.builtin.include_tasks: tasks/sleep-cloud.yml
+      when: not (keep_awake | default(false) | bool)
 
 - name: Ready
   hosts: localhost

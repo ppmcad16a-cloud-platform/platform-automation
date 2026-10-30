@@ -1,0 +1,26 @@
+# Put ONE standby cloud to sleep: everything stays configured (cluster,
+# add-ons, the shop, DNS, its Cloudflare pool), only the machines stop -
+# like a stopped EC2 instance. Its Cloudflare pool turns unhealthy; that is
+# expected for a standby.
+- name: "{{ inventory_hostname }} | only standbys may sleep (never the primary)"
+  ansible.builtin.assert:
+    that: inventory_hostname in standby
+    fail_msg: "{{ inventory_hostname }} is the primary cloud - it must always run."
+    quiet: true
+
+- name: "{{ inventory_hostname }} | is it awake?"
+  ansible.builtin.command: "{{ standby[inventory_hostname].state_cmd }}"
+  register: power
+  changed_when: false
+
+- name: "{{ inventory_hostname }} | go to sleep (AKS stop / EKS nodes -> 0)"
+  ansible.builtin.command: "{{ item }}"
+  loop: "{{ standby[inventory_hostname].sleep }}"
+  when: power.stdout | trim != standby[inventory_hostname].asleep_when
+  changed_when: true
+
+- name: "{{ inventory_hostname }} | asleep now"
+  ansible.builtin.command: "{{ standby[inventory_hostname].state_cmd }}"
+  register: power_after
+  changed_when: false
+  failed_when: power_after.stdout | trim != standby[inventory_hostname].asleep_when

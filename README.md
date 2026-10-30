@@ -11,6 +11,7 @@ Ansible playbooks that run the multi-cloud MERN platform's routine work:
 | `playbooks/drill-failover.yml` | `-e drill_cloud=azure` - takes one cloud's gateway away for 5 min; shop must stay up, MernServiceDown must fire |
 | `playbooks/drill-restore.yml` | Runs Jenkins' restore-drill for GCS, S3 and Azure Blob and waits for all three verdicts |
 | `playbooks/standby.yml` / `playbooks/wake.yml` | Stopped standbys: Azure + AWS sleep (AKS stopped, EKS nodes 0) while GCP serves everyone; `wake.yml -e cloud=azure` starts one in ~5-10 min |
+| `playbooks/drill-failover.yml` | Stopped-standby drill: closes GCP's front door, a standby wakes (automatic, or `-e wake_via=manual`), measures the RTO, then repairs GCP and puts the standbys back to sleep |
 
 Every Terraform step runs through `playbooks/tasks/tf-apply.yml`: plan -> check the kinds of change -> apply that exact plan.
 

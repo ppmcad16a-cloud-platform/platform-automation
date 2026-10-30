@@ -35,15 +35,15 @@
       {{ local_tags }}. Run deploy-mern for it once {{ primary_cloud }} is back.
   when: primary_deploys.rc != 0
 
-- name: "{{ inventory_hostname }} | upgrade what differs from {{ primary_cloud }}"
-  ansible.builtin.command:
-    cmd: >-
-      helm upgrade --install {{ item }} charts/microservice
-      --kube-context {{ kube_context }} --namespace mern
-      -f values/clouds/{{ inventory_hostname }}.yaml -f values/services/{{ item }}.yaml
-      --set image.tag={{ primary_tags[item] }}
-      --rollback-on-failure --wait --timeout 8m
-    chdir: "{{ repos_root }}/platform-deployments"
+- name: "{{ inventory_hostname }} | services whose version differs from {{ primary_cloud }}"
+  ansible.builtin.set_fact:
+    behind: "{{ behind | default([]) + [item] }}"
   loop: "{{ shop_services | select('in', primary_tags) | list }}"
   when: primary_tags[item] != local_tags.get(item, '')
-  changed_when: true
+
+- name: "{{ inventory_hostname }} | upgrade them - all at once (rolling, auto-rollback)"
+  ansible.builtin.include_tasks: install-shop.yml
+  vars:
+    shop_install_services: "{{ behind }}"
+    shop_install_tags: "{{ primary_tags }}"
+  when: behind | default([]) | length > 0

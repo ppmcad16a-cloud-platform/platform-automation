@@ -11,6 +11,7 @@
     cmd: terraform init -input=false -no-color
     chdir: "{{ tf_dir }}"
   changed_when: false
+  throttle: 1 # the shared plugin cache is not safe for two inits at once (takes seconds)
 
 - name: "{{ tf_label }} | terraform plan"
   ansible.builtin.command:

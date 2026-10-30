@@ -1,0 +1,33 @@
+# Install / upgrade shop services in ONE cloud - ALL AT THE SAME TIME. Each
+# one is its own rolling update with automatic rollback; then we wait for
+# every one of them.
+# Vars:
+#   shop_install_services  list of service names, e.g. [catalog-service]
+#   shop_install_tags      dict service -> image tag, e.g. {catalog-service: main-a1b2c3d}
+- name: "{{ inventory_hostname }} | helm upgrade --install - all services at once"
+  ansible.builtin.command:
+    cmd: >-
+      helm upgrade --install {{ item }} charts/microservice
+      --kube-context {{ kube_context }} --namespace mern
+      -f values/clouds/{{ inventory_hostname }}.yaml -f values/services/{{ item }}.yaml
+      --set image.tag={{ shop_install_tags[item] }}
+      --rollback-on-failure --wait --timeout 8m
+    chdir: "{{ repos_root }}/platform-deployments"
+  loop: "{{ shop_install_services }}"
+  loop_control:
+    label: "{{ item }}:{{ shop_install_tags[item] }}"
+  async: 900 # run in the background, up to 15 minutes
+  poll: 0 # ... and start the next one immediately
+  register: shop_jobs
+  changed_when: true
+
+- name: "{{ inventory_hostname }} | wait until every service is rolled out"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop: "{{ shop_jobs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: shop_done
+  until: shop_done.finished
+  retries: 90
+  delay: 10

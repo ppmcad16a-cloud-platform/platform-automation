@@ -48,3 +48,36 @@ leftover_checks:
     - what: load balancers made for the gateway
       cmd: gcloud compute forwarding-rules list --project project-899ced78-a554-40c2-96c --format="value(name)"
   azure: [] # AKS deletes its disks and load balancer together with the cluster
+
+# ---------- used by up.yml
+azure_tenant_id: 0fd463ca-1b22-4674-bea5-699c2e0ad98b
+domain: rishavmukhopadhyay.store
+
+# kubectl access after a cluster is (re)created - its old entry is stale.
+get_credentials:
+  gcp:
+    - gcloud container clusters get-credentials prod-gke --zone asia-south1-a --project project-899ced78-a554-40c2-96c
+  azure:
+    - az aks get-credentials --resource-group rg-prod-cluster --name prod-aks --overwrite-existing
+    - kubelogin convert-kubeconfig -l azurecli
+  aws:
+    - aws eks update-kubeconfig --name prod-eks --region ap-south-1 --profile HeroviredProfile
+
+# Third-party images AKS pulls from OUR registry (ghcr.io stalls in Azure
+# Central India). up.yml copies any that are missing (az acr import).
+acr_name: acrmern0botwx
+acr_mirrors:
+  - { source: "ghcr.io/external-secrets/external-secrets:v2.12.0", repo: external-secrets/external-secrets, tag: v2.12.0 }
+  - { source: "ghcr.io/opencost/opencost:1.121.3", repo: opencost/opencost, tag: 1.121.3 }
+  - { source: "ghcr.io/opencost/opencost-ui:1.121.3", repo: opencost/opencost-ui, tag: 1.121.3 }
+
+# The shop: services in install order, and which image tag each one runs
+# (same file the manual runbook used; CI tags look like main-a1b2c3d).
+image_tags_file: /mnt/c/Users/dell/image-tags.json
+shop_services:
+  - identity-service
+  - catalog-service
+  - commerce-service
+  - notification-service
+  - api-gateway-service
+  - client-service

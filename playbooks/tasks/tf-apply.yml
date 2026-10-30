@@ -1,31 +1,32 @@
-# global-platform: plan -> check WHAT the plan does -> apply exactly that plan.
-# allowed_actions: what the plan may do, e.g. [delete] at the end of a
-# session. Anything else (e.g. replacing the origin certificate) stops here.
-- name: global | stack folder
-  ansible.builtin.set_fact:
-    global_root: "{{ repos_root }}/global-platform"
-
-- name: global | terraform init
+# Guarded Terraform apply for ONE stack:
+#   plan -> read WHAT the plan would do -> stop unless every change is one of
+#   allowed_actions -> apply exactly that plan.
+# Vars:
+#   tf_dir           the stack folder
+#   tf_label         a short name for the output, e.g. "gcp/cluster"
+#   allowed_actions  e.g. [create, update] (session start) or [delete] (end)
+# A "replace" shows up as delete + create, so [create, update] never allows it.
+- name: "{{ tf_label }} | terraform init"
   ansible.builtin.command:
     cmd: terraform init -input=false -no-color
-    chdir: "{{ global_root }}"
+    chdir: "{{ tf_dir }}"
   changed_when: false
 
-- name: global | terraform plan
+- name: "{{ tf_label }} | terraform plan"
   ansible.builtin.command:
     cmd: terraform plan -input=false -no-color -out=ansible.tfplan
-    chdir: "{{ global_root }}"
+    chdir: "{{ tf_dir }}"
   changed_when: false
 
-- name: global | read the plan
+- name: "{{ tf_label }} | read the plan"
   ansible.builtin.command:
     cmd: terraform show -json ansible.tfplan
-    chdir: "{{ global_root }}"
+    chdir: "{{ tf_dir }}"
   register: plan_json
   changed_when: false
-  no_log: true # the JSON contains secret values
+  no_log: true # the JSON can contain secret values
 
-- name: global | what would change
+- name: "{{ tf_label }} | what would change"
   ansible.builtin.set_fact:
     planned: >-
       {{ (plan_json.stdout | from_json).resource_changes | default([])
@@ -38,26 +39,26 @@
                | map(attribute='change.actions'))
          | list }}
 
-- name: global | show it
+- name: "{{ tf_label }} | show it"
   ansible.builtin.debug:
     msg: "{{ planned | map('join', ' -> ') | list if planned else 'nothing to change' }}"
 
-- name: "global | the plan may only: {{ allowed_actions | join(', ') }}"
+- name: "{{ tf_label }} | the plan may only: {{ allowed_actions | join(', ') }}"
   ansible.builtin.assert:
     that: planned | map('last') | flatten | difference(allowed_actions) | length == 0
     fail_msg: >-
-      The global plan wants to do more than {{ allowed_actions | join('/') }} (see above).
-      Stopping - review it by hand: cd global-platform; terraform plan
+      {{ tf_label }}: the plan wants to do more than {{ allowed_actions | join('/') }} (see above).
+      Stopping - review it by hand: cd {{ tf_dir }}; terraform plan
     quiet: true
 
-- name: global | terraform apply (exactly the plan above)
+- name: "{{ tf_label }} | terraform apply (exactly the plan above)"
   ansible.builtin.command:
     cmd: terraform apply -input=false -no-color ansible.tfplan
-    chdir: "{{ global_root }}"
+    chdir: "{{ tf_dir }}"
   when: planned | length > 0
   changed_when: true
 
-- name: global | remove the plan file
+- name: "{{ tf_label }} | remove the plan file"
   ansible.builtin.file:
-    path: "{{ global_root }}/ansible.tfplan"
+    path: "{{ tf_dir }}/ansible.tfplan"
     state: absent

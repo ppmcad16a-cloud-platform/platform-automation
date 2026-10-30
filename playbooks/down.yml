@@ -35,7 +35,9 @@
   gather_facts: false
   environment: "{{ tf_env | combine(global_secrets_env) }}"
   tasks:
-    - name: Plan, check that it only deletes, apply
-      ansible.builtin.include_tasks: tasks/global-apply.yml
+    - name: Guarded apply (delete only)
+      ansible.builtin.include_tasks: tasks/tf-apply.yml
       vars:
+        tf_dir: "{{ repos_root }}/global-platform"
+        tf_label: global
         allowed_actions: [delete]

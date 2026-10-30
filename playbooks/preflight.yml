@@ -49,7 +49,8 @@
           Not logged in everywhere (gcp={{ gcp_login.rc == 0 }}, azure={{ az_login.rc == 0 }},
           aws={{ aws_login.rc == 0 }}). In WSL run:
           gcloud auth application-default login --no-launch-browser ;
-          az login --use-device-code ;
+          az login --tenant {{ azure_tenant_id }} (browser sign-in; device codes are blocked by
+          the directory's security defaults) and az account set --subscription {{ azure_subscription_id }} ;
           aws sso login --profile HeroviredProfile --use-device-code
         success_msg: "Logged in to GCP, Azure (subscription {{ az_login.stdout }}) and AWS ({{ aws_login.stdout }})"
 

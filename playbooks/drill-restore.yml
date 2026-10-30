@@ -1,0 +1,109 @@
+# Restore drill: runs Jenkins' "restore-drill" job once per backup copy
+# (gcs, s3, azure) and waits for all three verdicts. Each run downloads the
+# newest backup from that cloud, checks its fingerprint, restores it into the
+# scratch database and compares document counts (see platform-deployments).
+#
+# Jenkins is reached through a temporary kubectl port-forward (no public
+# access needed), as the admin user; its password comes from Terraform.
+#
+# Run:  ansible-playbook playbooks/drill-restore.yml
+- name: Restore drill - newest backup from GCS, S3 and Azure Blob
+  hosts: gcp
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  vars:
+    sources: [gcs, s3, azure]
+    jenkins: http://127.0.0.1:18080
+  tasks:
+    - name: Jenkins admin password (from the gcp add-ons stack)
+      ansible.builtin.command:
+        cmd: terraform output -raw jenkins_admin_password
+        chdir: "{{ repos_root }}/gcp-platform/environments/prod/addons"
+      register: jenkins_pw
+      changed_when: false
+      no_log: true
+
+    - name: The drill (always closes the port-forward)
+      block:
+        - name: Open a port-forward to Jenkins (runs in the background)
+          ansible.builtin.command: >-
+            kubectl --context {{ kube_context }} -n jenkins port-forward svc/jenkins 18080:8080
+          async: 3600
+          poll: 0
+          changed_when: false
+
+        - name: Wait until it answers
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 18080
+            timeout: 60
+
+        - name: Get a CSRF "crumb" (Jenkins requires one for POST requests)
+          ansible.builtin.uri:
+            url: "{{ jenkins }}/crumbIssuer/api/json"
+            user: admin
+            password: "{{ jenkins_pw.stdout }}"
+            force_basic_auth: true
+            return_content: true
+          register: crumb
+          no_log: true
+
+        - name: Start restore-drill for each source
+          ansible.builtin.uri:
+            url: "{{ jenkins }}/job/restore-drill/buildWithParameters?SOURCE={{ item }}"
+            method: POST
+            user: admin
+            password: "{{ jenkins_pw.stdout }}"
+            force_basic_auth: true
+            headers:
+              Jenkins-Crumb: "{{ crumb.json.crumb }}"
+              Cookie: "{{ crumb.cookies_string }}"
+            status_code: 201
+          loop: "{{ sources }}"
+          register: queued
+          no_log: true
+
+        - name: Wait until each queued run has a build number
+          ansible.builtin.uri:
+            url: "{{ item.location }}api/json"
+            user: admin
+            password: "{{ jenkins_pw.stdout }}"
+            force_basic_auth: true
+            return_content: true
+          loop: "{{ queued.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          register: queue_items
+          until: queue_items.json.executable is defined and queue_items.json.executable
+          retries: 60
+          delay: 10
+
+        - name: Wait for each run to finish (the runs go one after another)
+          ansible.builtin.uri:
+            url: "{{ item.json.executable.url | regex_replace('^https?://[^/]+', jenkins) }}api/json"
+            user: admin
+            password: "{{ jenkins_pw.stdout }}"
+            force_basic_auth: true
+            return_content: true
+          loop: "{{ queue_items.results }}"
+          loop_control:
+            label: "{{ item.item.item }} -> #{{ item.json.executable.number }}"
+          register: builds
+          until: not builds.json.building
+          retries: 120
+          delay: 10
+      always:
+        - name: Close the port-forward
+          ansible.builtin.command: pkill -f "port-forward svc/jenkins 18080:8080"
+          failed_when: false
+          changed_when: false
+
+    - name: Drill report
+      ansible.builtin.debug:
+        msg: "{{ builds.results | map(attribute='item.item.item') | zip(builds.results | map(attribute='json.result')) | map('join', ': ') | list }}"
+
+    - name: All three backup copies restored and verified
+      ansible.builtin.assert:
+        that: builds.results | map(attribute='json.result') | unique == ['SUCCESS']
+        fail_msg: "Restore drill FAILED for at least one source - see the report above and the Jenkins logs."
+        success_msg: "Restore drill PASSED: GCS, S3 and Azure Blob copies all restore and match."

@@ -1,97 +1,161 @@
-# Failover drill: take ONE cloud's front door away and prove that
-#   1. the shop (https://<domain>) keeps answering - Cloudflare moves traffic
-#      to the other clouds within about a minute (health check every 60 s),
-#   2. the alert fires (MernServiceDown in that cloud's Alertmanager -> Slack),
-#   3. the cloud comes back healthy afterwards.
-# The gateway is ALWAYS scaled back, even if a check fails.
+# Failover drill (stopped-standby model): the PRIMARY (GCP) fails, a sleeping
+# standby wakes up and takes over. Measures the outage = RTO (recovery time).
 #
-# Run:  ansible-playbook playbooks/drill-failover.yml -e drill_cloud=azure   (gcp | azure | aws)
-- name: "Failover drill - take {{ drill_cloud | default('azure') }} out for {{ drill_minutes | default(5) }} minutes"
-  hosts: "{{ drill_cloud | default('azure') }}"
+#   1. GCP:        shop healthy, standbys asleep -> close GCP's front door
+#   2. (watch):    the shop goes down (no healthy pool left)
+#   3. Azure, AWS: wake up - automatically (Cloudflare -> Worker -> GitHub
+#                  Actions), or with -e wake_via=manual by this playbook
+#   4. (watch):    the shop answers again - served by a woken standby
+#   5. GCP:        front door reopened (ALWAYS - its own play), alert checked
+#   6. Azure, AWS: back to sleep (skip with -e keep_awake=true)
+#   7. Report:     RTO; passes if <= rto_target_minutes (default 20)
+#
+# Run:  ansible-playbook playbooks/drill-failover.yml                      # automatic wake
+#       ansible-playbook playbooks/drill-failover.yml -e wake_via=manual   # this playbook wakes them
+- name: 1. Break the primary (GCP)
+  hosts: gcp
   gather_facts: false
   environment: "{{ tf_env }}"
-  vars:
-    minutes: "{{ drill_minutes | default(5) | int }}"
-    probe_every: 10 # seconds
-    # Cloudflare needs up to ~60-90 s to notice; failures before that are
-    # expected and only reported, failures AFTER it fail the drill.
-    grace_probes: 12 # = 120 s
-    shop_url: "https://{{ domain }}/api/health"
-    cloud_url: "https://{{ inventory_hostname }}.{{ domain }}/api/health"
   tasks:
-    - name: Before - shop and {{ inventory_hostname }} are healthy
+    - name: Before - the shop is healthy
       ansible.builtin.uri:
-        url: "{{ item }}"
-      loop: ["{{ shop_url }}", "{{ cloud_url }}"]
+        url: "https://{{ domain }}/api/health"
 
-    - name: Remember how many gateway pods {{ inventory_hostname }} runs
+    - name: Before - the standbys are asleep (otherwise there is nothing to test)
+      ansible.builtin.command: "{{ standby[item].state_cmd }}"
+      loop: "{{ standby.keys() | list }}"
+      register: standby_state
+      changed_when: false
+      failed_when: standby_state.stdout | trim != standby[item].asleep_when
+
+    - name: Remember how many gateway pods GCP runs
       ansible.builtin.command: >-
         kubectl --context {{ kube_context }} -n mern get deploy api-gateway-service -o jsonpath={.spec.replicas}
       register: replicas_before
       changed_when: false
 
-    - name: The drill (always restores the gateway)
-      block:
-        - name: "{{ inventory_hostname }} | scale the gateway to 0 (the cloud's front door closes)"
-          ansible.builtin.command: >-
-            kubectl --context {{ kube_context }} -n mern scale deploy api-gateway-service --replicas=0
-          changed_when: true
+    - name: Close GCP's front door (gateway -> 0 pods)
+      ansible.builtin.command: >-
+        kubectl --context {{ kube_context }} -n mern scale deploy api-gateway-service --replicas=0
+      changed_when: true
 
-        - name: "Probe the shop every {{ probe_every }} s for {{ minutes }} minutes"
-          ansible.builtin.uri:
-            url: "{{ shop_url }}"
-            timeout: 8
-          register: probes
-          failed_when: false
-          loop: "{{ range(0, (minutes | int) * 60 // probe_every) | list }}"
-          loop_control:
-            pause: "{{ probe_every }}"
-            label: "probe {{ item }}"
+    - name: Start the clock
+      ansible.builtin.set_fact:
+        t_break: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
 
-        - name: "{{ inventory_hostname }} | does Alertmanager have MernServiceDown firing?"
-          ansible.builtin.command: >-
-            kubectl --context {{ kube_context }} -n monitoring get --raw
-            /api/v1/namespaces/monitoring/services/kps-alertmanager:9093/proxy/api/v2/alerts
-          register: alerts
-          changed_when: false
-
-        - name: Results
-          ansible.builtin.set_fact:
-            failed_early: "{{ probes.results[:grace_probes] | rejectattr('status', 'equalto', 200) | list | length }}"
-            failed_late: "{{ probes.results[grace_probes:] | rejectattr('status', 'equalto', 200) | list | length }}"
-            alert_fired: >-
-              {{ alerts.stdout | from_json
-                 | selectattr('labels.alertname', 'equalto', 'MernServiceDown')
-                 | selectattr('labels.deployment', 'equalto', 'api-gateway-service')
-                 | list | length > 0 }}
-      always:
-        - name: "{{ inventory_hostname }} | scale the gateway back to {{ replicas_before.stdout }}"
-          ansible.builtin.command: >-
-            kubectl --context {{ kube_context }} -n mern scale deploy api-gateway-service --replicas={{ replicas_before.stdout }}
-          changed_when: true
-
-    - name: After - {{ inventory_hostname }} is healthy again
+- name: 2. The shop goes down (no healthy pool left)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Wait until the shop fails (Cloudflare checks every 60 s)
       ansible.builtin.uri:
-        url: "{{ cloud_url }}"
-      register: back
-      until: back.status == 200
+        url: "https://{{ domain }}/api/health"
+        timeout: 8
+      register: down
+      until: down.status != 200
+      retries: 30
+      delay: 10
+      failed_when: false
+    - name: Outage started
+      ansible.builtin.set_fact:
+        t_down: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+
+- name: 3. The standbys wake up
+  hosts: azure:aws
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Wake them ourselves (-e wake_via=manual)
+      ansible.builtin.include_tasks: tasks/wake-cloud.yml
+      when: (wake_via | default('auto')) == 'manual'
+
+    - name: Watch the automatic wake-up (Cloudflare -> Worker -> GitHub Actions)
+      ansible.builtin.command: "{{ standby[inventory_hostname].state_cmd }}"
+      register: auto_state
+      until: auto_state.stdout | trim != standby[inventory_hostname].asleep_when
+      retries: 80
+      delay: 15
+      changed_when: false
+      failed_when: false
+      when: (wake_via | default('auto')) == 'auto'
+
+- name: 4. The shop answers again - served by a woken standby
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Wait until the shop answers 200 (GCP is still down, so a standby serves it)
+      ansible.builtin.uri:
+        url: "https://{{ domain }}/api/health"
+        timeout: 8
+      register: up
+      until: up.status == 200
+      retries: 120
+      delay: 10
+      failed_when: false
+    - name: Outage over
+      ansible.builtin.set_fact:
+        t_up: "{{ lookup('ansible.builtin.pipe', 'date +%s') | int }}"
+        recovered: "{{ up.status == 200 }}"
+
+- name: 5. Repair the primary (GCP) - always runs
+  hosts: gcp
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Did GKE's Alertmanager raise MernServiceDown for the gateway?
+      ansible.builtin.command: >-
+        kubectl --context {{ kube_context }} -n monitoring get --raw
+        /api/v1/namespaces/monitoring/services/kps-alertmanager:9093/proxy/api/v2/alerts
+      register: alerts
+      changed_when: false
+      failed_when: false
+    - name: Remember it
+      ansible.builtin.set_fact:
+        alert_fired: >-
+          {{ alerts.rc == 0 and (alerts.stdout | from_json
+             | selectattr('labels.alertname', 'equalto', 'MernServiceDown')
+             | selectattr('labels.deployment', 'equalto', 'api-gateway-service') | list | length > 0) }}
+    - name: Reopen GCP's front door
+      ansible.builtin.command: >-
+        kubectl --context {{ kube_context }} -n mern scale deploy api-gateway-service --replicas={{ replicas_before.stdout }}
+      changed_when: true
+    - name: GCP is healthy again
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}.{{ domain }}/api/health"
+      register: gcp_back
+      until: gcp_back.status == 200
       retries: 30
       delay: 10
 
-    - name: Drill report
+- name: 6. Standbys back to sleep (GCP serves everyone again)
+  hosts: azure:aws
+  gather_facts: false
+  environment: "{{ tf_env }}"
+  tasks:
+    - name: Sleep
+      ansible.builtin.include_tasks: tasks/sleep-cloud.yml
+      when: not (keep_awake | default(false) | bool)
+
+- name: 7. Drill report
+  hosts: localhost
+  gather_facts: false
+  vars:
+    target_s: "{{ (rto_target_minutes | default(20) | int) * 60 }}"
+    t_break: "{{ hostvars['gcp'].t_break | int }}"
+    rto_s: "{{ (t_up | int) - (t_break | int) }}"
+  tasks:
+    - name: Report
       ansible.builtin.debug:
         msg:
-          - "Shop probes: {{ probes.results | length }} in {{ minutes }} min"
-          - "Failed in the first {{ grace_probes * probe_every }} s (Cloudflare still detecting): {{ failed_early }}"
-          - "Failed after that (must be 0): {{ failed_late }}"
-          - "MernServiceDown firing in {{ inventory_hostname }}: {{ alert_fired }}"
-
+          - "Wake-up: {{ wake_via | default('auto') }}"
+          - "Shop down after: {{ (t_down | int) - (t_break | int) }} s (Cloudflare noticed the primary failing)"
+          - "Shop back (served by a standby): {{ recovered }}"
+          - "RTO (front door closed -> shop answering again): {{ (rto_s | int) // 60 }} min {{ (rto_s | int) % 60 }} s  (target {{ rto_target_minutes | default(20) }} min)"
+          - "MernServiceDown alert raised in GCP: {{ hostvars['gcp'].alert_fired | default(false) }}"
     - name: The drill passed
       ansible.builtin.assert:
         that:
-          - failed_late | int == 0
-          - alert_fired | bool
-        fail_msg: >-
-          Failover drill FAILED: {{ failed_late }} failed requests after the grace period,
-          alert fired = {{ alert_fired }}.
-        success_msg: "Failover drill PASSED for {{ inventory_hostname }}"
+          - recovered | bool
+          - rto_s | int <= target_s | int
+        fail_msg: "Failover drill FAILED - the shop did not come back from a standby within {{ rto_target_minutes | default(20) }} minutes."
+        success_msg: "Failover drill PASSED - RTO {{ (rto_s | int) // 60 }} min {{ (rto_s | int) % 60 }} s"

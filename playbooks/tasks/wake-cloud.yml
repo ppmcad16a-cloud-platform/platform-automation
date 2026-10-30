@@ -36,3 +36,7 @@
   retries: 40
   delay: 15
   when: woke is changed
+
+- name: "{{ inventory_hostname }} | catch up to the primary's versions (Jenkins skipped it while it slept)"
+  ansible.builtin.include_tasks: sync-shop.yml
+  when: woke is changed

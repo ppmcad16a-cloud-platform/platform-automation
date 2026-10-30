@@ -1,0 +1,49 @@
+# Catch a woken standby up to the versions the PRIMARY (GCP) runs right now:
+# Jenkins skipped it while it slept. Only services whose version differs are
+# upgraded (same rolling, auto-rollback Helm command as up.yml).
+# If the primary is unreachable - a real disaster - the standby keeps the
+# versions it had (still a working shop) and this only warns.
+- name: "{{ inventory_hostname }} | versions running in the primary ({{ primary_cloud }})"
+  ansible.builtin.command: kubectl --context {{ hostvars[primary_cloud].kube_context }} -n mern get deploy -o json --request-timeout=20s
+  register: primary_deploys
+  changed_when: false
+  failed_when: false
+
+- name: "{{ inventory_hostname }} | versions running here"
+  ansible.builtin.command: kubectl --context {{ kube_context }} -n mern get deploy -o json
+  register: local_deploys
+  changed_when: false
+
+- name: "{{ inventory_hostname }} | read the image tags"
+  ansible.builtin.set_fact:
+    primary_tags: >-
+      {{ dict(primary_items | map(attribute='metadata.name')
+              | zip(primary_items | map(attribute='spec.template.spec.containers') | map('first')
+                    | map(attribute='image') | map('regex_replace', '^.*:', ''))) }}
+    local_tags: >-
+      {{ dict(local_items | map(attribute='metadata.name')
+              | zip(local_items | map(attribute='spec.template.spec.containers') | map('first')
+                    | map(attribute='image') | map('regex_replace', '^.*:', ''))) }}
+  vars:
+    primary_items: "{{ (primary_deploys.stdout | from_json)['items'] if primary_deploys.rc == 0 else [] }}"
+    local_items: "{{ (local_deploys.stdout | from_json)['items'] }}"
+
+- name: "{{ inventory_hostname }} | primary unreachable - keeping the current versions"
+  ansible.builtin.debug:
+    msg: >-
+      {{ primary_cloud }} did not answer, so {{ inventory_hostname }} keeps its last versions
+      {{ local_tags }}. Run deploy-mern for it once {{ primary_cloud }} is back.
+  when: primary_deploys.rc != 0
+
+- name: "{{ inventory_hostname }} | upgrade what differs from {{ primary_cloud }}"
+  ansible.builtin.command:
+    cmd: >-
+      helm upgrade --install {{ item }} charts/microservice
+      --kube-context {{ kube_context }} --namespace mern
+      -f values/clouds/{{ inventory_hostname }}.yaml -f values/services/{{ item }}.yaml
+      --set image.tag={{ primary_tags[item] }}
+      --rollback-on-failure --wait --timeout 8m
+    chdir: "{{ repos_root }}/platform-deployments"
+  loop: "{{ shop_services | select('in', primary_tags) | list }}"
+  when: primary_tags[item] != local_tags.get(item, '')
+  changed_when: true

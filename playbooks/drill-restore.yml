@@ -74,7 +74,7 @@
           loop_control:
             label: "{{ item.item }}"
           register: queue_items
-          until: queue_items.json.executable is defined and queue_items.json.executable
+          until: queue_items.json.executable is defined and queue_items.json.executable is not none
           retries: 60
           delay: 10
 
